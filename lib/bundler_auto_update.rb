@@ -3,137 +3,58 @@ require "bundler_auto_update/version"
 module Bundler
   module AutoUpdate
     class CLI
+      attr_reader :gem, :gemfile
+
       def initialize(argv)
         @argv = argv
       end
 
       def run!
-        Updater.new(test_command).auto_update!
-      end
-
-      # @return [String] Test command from @argv
-      def test_command
-        if @argv.first == '-c'
-          @argv[1..-1].join(' ')
+        unless @argv.first == '-noupdate'
+          gemfile.remove_all_versions
+          result = CommandRunner.system("bundle update")
+          return Logger.log_error("Aborting due to error") unless result
         end
-      end
-    end # class CLI
-
-    class Updater
-      DEFAULT_TEST_COMMAND = "rake"
-
-      attr_reader :test_command
-
-      def initialize(test_command = nil)
-        @test_command = test_command || DEFAULT_TEST_COMMAND
+        gemfile.set_versions(gemfile_lock.version_map)
+        CommandRunner.system("bundle install")
       end
 
-      def auto_update!
-        gemfile.gems.each do |gem|
-          GemUpdater.new(gem, gemfile, test_command).auto_update
-        end
-      end
-
-      private
-
-      def gemfile
+       def gemfile
         @gemfile ||= Gemfile.new
+       end
+
+       def gemfile_lock
+        @gemfile_lock ||= GemfileLock.new
+       end
+    end
+
+    class GemfileLock
+      attr_reader :version_map
+
+      def initialize
+        @version_map = {}
+        load_versions
+      end
+
+      def load_versions
+        @version_map = {}
+        content = File.read('Gemfile.lock')
+        content.dup.each_line do |l|
+          match = l.match(/^\s\s\s\s(.*)\s+\((.*)\)/)
+          if match
+            @version_map[match[1]] = match[2]
+          end
+        end
       end
     end
 
-    class GemUpdater
-      attr_reader :gem, :gemfile, :test_command
-
-      def initialize(gem, gemfile, test_command)
-        @gem, @gemfile, @test_command = gem, gemfile, test_command
-      end
-
-      # Attempt to update to patch, then to minor then to major versions.
-      def auto_update
-        if updatable?
-          Logger.log "Updating #{gem.name}"
-          update(:patch) and update(:minor) and update(:major)
-        else
-          Logger.log "#{gem.name} is not auto-updatable, passing it."
-        end
-      end
-
-      # Update current gem to latest :version_type:, run test suite and commit new Gemfile
-      # if successful.
-      #
-      # @param version_type :patch or :minor or :major
-      # @return [Boolean] true on success or when already at latest version
-      def update(version_type)
-        new_version = gem.last_version(version_type)
-
-        if new_version == gem.version
-          Logger.log_indent "Current gem already at latest #{version_type} version. Passing this update."
-
-          return true
-        end
-
-        Logger.log_indent "Updating to #{version_type} version #{new_version}"
-
-        gem.version = new_version
-
-        if update_gemfile and run_test_suite and commit_new_version
-          true
-        else
-          revert_to_previous_version
-          false
-        end
-      end
-
-      private
-
-      # Update gem version in Gemfile.
-      #
-      # @return true on success, false on failure.
-      def update_gemfile
-        if gemfile.update_gem(gem) 
-          Logger.log_indent "Gemfile updated successfully."
-          true
-        else
-          Logger.log_indent "Failed to update Gemfile."
-          false
-        end
-      end
-
-      # @return true on success, false on failure
-      def run_test_suite
-        Logger.log_indent "Running test suite"
-        if CommandRunner.system test_command
-          Logger.log_indent "Test suite ran successfully."
-          true
-        else
-          Logger.log_indent "Test suite failed to run."
-          false
-        end
-      end
-
-      # @return true when the gem has a fixed version.
-      def updatable?
-        gem.version =~ /^\d+\.\d+\.\d+$/
-      end
-
-      def commit_new_version
-        Logger.log_indent "Committing changes"
-        CommandRunner.system "git commit Gemfile Gemfile.lock -m 'Auto update #{gem.name} to version #{gem.version}'"
-      end
-
-      def revert_to_previous_version
-        Logger.log_indent "Reverting changes"
-        CommandRunner.system "git checkout Gemfile Gemfile.lock"
-        gemfile.reload!
-      end
-    end # class GemUpdater
-
     class Gemfile
+      attr_reader :content
 
       # Regex that matches a gem definition line.
       #
       # @return [RegEx] matching [_, name, _, version, _, options]
-      def gem_line_regex(gem_name = '(\w+)')
+      def gem_line_regex(gem_name = '(.*)')
         /^\s*gem\s*['"]#{gem_name}['"]\s*(,\s*['"](.+)['"])?\s*(,\s*(.*))?\n?$/
       end
 
@@ -166,6 +87,41 @@ module Bundler
         @content = read
       end
 
+      def set_versions(version_map)
+        new_content = ""
+        content.dup.each_line do |l|
+          if match = l.match(gem_line_regex)
+            Logger.log "atempting to update on line: #{l}"
+            _, name, _, version, _, options = match.to_a
+            if version_map[name]
+              Logger.log "updating #{name} to #{version_map[name]}"
+              l.gsub!("\n","")
+              l += ", \"~> #{version_map[name]}\"\n"
+            else
+              Logger.log_error "gem #{name} not found in Gemfile.lock"
+            end
+          end
+          new_content += l
+        end
+        @content = new_content
+        write
+      end
+
+      def remove_all_versions
+        new_content = ""
+        content.each_line do |l|
+          if l.match(/^(\s+)?gem/)
+            Logger.log "removing version from line: #{l}"
+            l.gsub!(/\,.*/, "")
+          else
+            Logger.log_error "ignoring line: #{l}"
+          end
+          new_content += l
+        end
+        @content = new_content
+        write
+      end
+
       private
 
       def update_content(gem)
@@ -192,15 +148,6 @@ module Bundler
           f.write(content)
         end
       end
-
-      # Attempt to run 'bundle install' and fall back on running 'bundle update :gem'.
-      #
-      # @param [Dependency] gem The gem to update
-      #
-      # @return true on success, false on failure
-      def run_bundle_update(gem)
-        CommandRunner.system("bundle install") or CommandRunner.system("bundle update #{gem.name}")
-      end
     end # class Gemfile
 
     class Logger
@@ -214,6 +161,11 @@ module Bundler
       def self.log_indent(msg)
         log(msg, "  - ")
       end
+
+      def self.log_error(msg)
+        log(msg, "  BAUError ")
+      end
+
 
       # Log command:
       # "  > bundle update"
