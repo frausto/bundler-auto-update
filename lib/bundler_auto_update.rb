@@ -110,7 +110,7 @@ module Bundler
       def remove_all_versions
         new_content = ""
         content.each_line do |l|
-          if l.match(/^(\s+)?gem/)
+          if l.match(/^(\s+)?gem/) && !l.match(/\,.*(github).*/)
             Logger.log "removing version from line: #{l}"
             l.gsub!(/\,.*/, "")
           else
